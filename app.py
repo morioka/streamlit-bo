@@ -50,6 +50,12 @@ def sample_generation(limit_data):  # ->generation_sample
     return np.array(x)
 
 def BO(data, generation_sample):    # -> next_samples, BO_model, autoscaled_x
+    X = data.iloc[:, 1:]
+    y = data.iloc[:, 0]
+    candidates_of_X = generation_sample
+    acquisition_function_flag = 2
+    cumulative_variance = None
+
     # https://github.com/hkaneko1985/design_of_experiments/blob/master/Python/bayesianoptimization.py
     # def bayesianoptimization(X, y, candidates_of_X, acquisition_function_flag, cumulative_variance=None):
     """
@@ -81,11 +87,6 @@ def BO(data, generation_sample):    # -> next_samples, BO_model, autoscaled_x
     cumulative_variance: numpy.array
         cumulative variance in mutual information (MI)[acquisition_function_flag=1]
     """
-    X = data.iloc[:, 1:]
-    y = data.iloc[:, 0]
-    candidates_of_X = generation_sample
-    acquisition_function_flag = 2
-    cumulative_variance = None
 
     X = np.array(X)
     y = np.array(y)
@@ -160,6 +161,7 @@ def tabs_set(data, limit_data):
                 x = BO_rsults[3]
                 
                 # --------------------省略----------------------------------
+                # TODO: ??
 
                 ss['next_samples'] = next_samples
                 ss['BO_model'] = BO_model
@@ -167,6 +169,7 @@ def tabs_set(data, limit_data):
                 ss['x'] = x
 
                 # --------------------省略----------------------------------
+                # 評価値を計算する
                 y_estimated_y_plot = [[0, 1],[0,1]]
                 y_estimated_y_r2 = 0
                 y_estimated_y_mae = 0
@@ -213,10 +216,10 @@ def tabs_set(data, limit_data):
             if 'SHAP_plot' not in ss:
                 pass
                 # --------------------省略----------------------------------
+                # TODO: SHAP値を計算して、出力画像を表示
                 ss['SHAP_plot'] = SHAP_explain(ss['BO_model'],
                                                ss['autoscaled_x'],
                                                ss['x'])
-                # で表示
 
 def main():
     st.set_page_config(
