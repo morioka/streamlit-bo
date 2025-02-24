@@ -8,21 +8,25 @@ import numpy as np
 from scipy.stats import norm
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, DotProduct, WhiteKernel, RBF, ConstantKernel
+from sklearn.metrics import r2_score, mean_absolute_error, root_mean_squared_error
 
 import random
-
 
 
 def SHAP_explain(BO_model, autoscaled_x, x):
     with st.spinner():
         explainer = shap.KernelExplainer(BO_model.predict, autoscaled_x)
         shap_values = explainer.shap_values(autoscaled_x)
-
+        
         plt.figure()
         shap.summary_plot(shap_values, autoscaled_x, feature_names=x.columns)
         plt.savefig('shap_summary_plot.png')
+        
+        plt.figure()
+        shap.summary_plot(shap_values, autoscaled_x, plot_type="bar", feature_names=x.columns)
+        plt.savefig('shap_bar_plot.png')
     
-    return 'shap_summary_plot.png'
+    return 'shap_summary_plot.png','shap_bar_plot.png'
 
 def plot_scatter(data, x_col, y_col, z_col, color_col):
     # Streamlitを使って3D散布図を簡単に表示する
@@ -45,7 +49,7 @@ def plot_scatter(data, x_col, y_col, z_col, color_col):
 def sample_generation(limit_data):  # ->generation_sample
     n_samples = 30
 
-    limits = limit_data.values
+    limits = limit_data.T.values    # [[upper,...], [lower, ...]] -> [[upper, lower], ...]
     x = [[random.uniform(lower, upper) for (upper, lower) in limits] for _ in range(n_samples)]
     return np.array(x)
 
@@ -53,7 +57,7 @@ def BO(data, generation_sample):    # -> next_samples, BO_model, autoscaled_x
     X = data.iloc[:, 1:]
     y = data.iloc[:, 0]
     candidates_of_X = generation_sample
-    acquisition_function_flag = 2
+    acquisition_function_flag = 2   # Expected improvement(EI)
     cumulative_variance = None
 
     # https://github.com/hkaneko1985/design_of_experiments/blob/master/Python/bayesianoptimization.py
@@ -127,8 +131,15 @@ def BO(data, generation_sample):    # -> next_samples, BO_model, autoscaled_x
     selected_candidate_number = np.where(acquisition_function_values == max(acquisition_function_values))[0][0]
     selected_X_candidate = candidates_of_X[selected_candidate_number, :]
 
+    # 評価
+    estimated_autoscaled_y = gaussian_process_model.predict(autoscaled_X, return_std=False)
+    y_estimated_y_r2 = r2_score(autoscaled_y, estimated_autoscaled_y)
+    y_estimated_y_mae = mean_absolute_error(autoscaled_y, estimated_autoscaled_y)
+    y_estimated_y_rmse = root_mean_squared_error(autoscaled_y, estimated_autoscaled_y)
+
     #return selected_candidate_number, selected_X_candidate, cumulative_variance
-    return selected_X_candidate, gaussian_process_model, autoscaled_X
+    X = data.iloc[:, 1:]    # pd.DataFrame再設定
+    return selected_X_candidate, gaussian_process_model, autoscaled_X, X, (y_estimated_y_r2, y_estimated_y_mae, y_estimated_y_rmse)
  
 def tabs_set(data, limit_data):
     tab_titles = ["データの確認", "実験点の提案", "解析", "予測"]
@@ -171,9 +182,9 @@ def tabs_set(data, limit_data):
                 # --------------------省略----------------------------------
                 # 評価値を計算する
                 y_estimated_y_plot = [[0, 1],[0,1]]
-                y_estimated_y_r2 = 0
-                y_estimated_y_mae = 0
-                y_estimated_y_rmse = 0
+                y_estimated_y_r2 = BO_rsults[4][0]
+                y_estimated_y_mae = BO_rsults[4][1]
+                y_estimated_y_rmse = BO_rsults[4][2]
                 y_estimated_y_in_cv_plot = [[0, 1],[0,1]]
                 y_estimated_y_in_cv_r2 = 0
                 y_estimated_y_in_cv_mae = 0
@@ -213,13 +224,29 @@ def tabs_set(data, limit_data):
                 
     with tabs[2]:
         if st.checkbox('SHAP解析', help='「実験点の提案」タブでモデルを構築してから'):
-            if 'SHAP_plot' not in ss:
-                pass
-                # --------------------省略----------------------------------
-                # TODO: SHAP値を計算して、出力画像を表示
-                ss['SHAP_plot'] = SHAP_explain(ss['BO_model'],
-                                               ss['autoscaled_x'],
-                                               ss['x'])
+            if 'shap_summary_plot' not in ss:
+                BO_model = ss['BO_model']
+                autoscaled_x = ss['autoscaled_x']
+                x = ss['x']
+                SHAP_plot = SHAP_explain(BO_model, autoscaled_x, x)
+                
+                shap_summary_plot = SHAP_plot[0]
+                shap_bar_plot = SHAP_plot[1]
+
+                ss['shap_summary_plot'] = shap_summary_plot
+                ss['shap_bar_plot'] = shap_bar_plot
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.image(shap_summary_plot)
+                with col2:
+                    st.image(shap_bar_plot)
+            else:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.image(ss['shap_summary_plot'])
+                with col2:
+                    st.image(ss['shap_bar_plot'])
 
 def main():
     st.set_page_config(
@@ -230,11 +257,25 @@ def main():
     st.set_option('deprecation.showPyplotGlobalUse', False)
     st.title('実験点提案@ベイズ最適化')
 
-    uploaded_file = st.file_uploader('データを読み込んで下さい。', type=['xlsx'], key = 'train_data')
+    uploaded_file = st.file_uploader('データを読み込んで下さい。', type=['xlsx', 'csv'], key = 'train_data')
     if uploaded_file:
-        data = pd.read_excel(uploaded_file, sheet_name=0)
-        limit_data = pd.read_excel(uploaded_file, sheet_name=1, index_col=0)
-        
+        if uploaded_file.name[-5:] == '.xlsx':
+            data = pd.read_excel(uploaded_file, sheet_name=0)
+            limit_data = pd.read_excel(uploaded_file, sheet_name=1, index_col=0)
+        else:   # csvもサポート
+            data = pd.read_csv(uploaded_file)
+            data = data.iloc[:,1:]
+            limit_data = None
+
+        if uploaded_file.name[-4:] == '.csv':
+            uploaded_limit_file = st.file_uploader('制約データを読み込んで下さい。', type=['csv'], key = 'train_data_limit')
+            if uploaded_limit_file:
+                limit_data = pd.read_csv(uploaded_limit_file, index_col=0)
+
+        if data is None:
+            return
+        if limit_data is None:
+            return
         tabs_set(data, limit_data)
 
 
