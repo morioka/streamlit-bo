@@ -1,0 +1,4 @@
+﻿,min,max,step,values
+temperature,0.0,10.0,0.5,
+time,20.0,90.0,5.0,
+material,,,,"A,B,C"

@@ -18,6 +18,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import (
     RBF,
@@ -33,7 +34,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, root_mean_squared_error
 from sklearn.model_selection import KFold, LeaveOneOut, cross_val_predict
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
 RANDOM_STATE = 42
@@ -45,6 +46,8 @@ class ModelBundle:
     model: Pipeline
     feature_columns: list[str]
     target_column: str
+    numeric_features: list[str]
+    categorical_features: list[str]
     cv_prediction: np.ndarray
     train_prediction: np.ndarray
     selected_kernel: str
@@ -89,7 +92,28 @@ def main() -> None:
         st.error("実験データと探索範囲の両方にデータを入れてください。")
         return
 
+    issues = validate_input_tables(data, limit_data)
+    if issues:
+        for issue in issues:
+            st.warning(issue)
+
     tabs_set(data, limit_data)
+
+
+def validate_input_tables(data: pd.DataFrame, limit_data: pd.DataFrame) -> list[str]:
+    issues: list[str] = []
+    if data.columns.duplicated().any():
+        duplicated = data.columns[data.columns.duplicated()].tolist()
+        issues.append(f"実験データに重複した列名があります: {', '.join(map(str, duplicated))}")
+    if data.isna().any().any():
+        missing_count = int(data.isna().sum().sum())
+        issues.append(f"実験データに欠損値が {missing_count} 個あります。説明変数は自動補完し、目的変数の欠損行は除外します。")
+    if limit_data.columns.duplicated().any():
+        duplicated = limit_data.columns[limit_data.columns.duplicated()].tolist()
+        issues.append(f"探索範囲に重複した列名があります: {', '.join(map(str, duplicated))}")
+    if not {"min", "max"}.issubset({str(col).strip().lower() for col in limit_data.columns}):
+        issues.append("探索範囲には、数値変数用の `min` と `max` 列があると候補点を安定して作れます。")
+    return issues
 
 
 def file_types_for_format(input_format: str) -> list[str]:
@@ -115,6 +139,7 @@ def tabs_set(data: pd.DataFrame, limit_data: pd.DataFrame) -> None:
     ss = st.session_state
 
     numeric_columns = data.select_dtypes(include=np.number).columns.tolist()
+    candidate_feature_columns = data.columns.tolist()
     default_target_index = max(len(numeric_columns) - 1, 0)
 
     with tabs[0]:
@@ -136,14 +161,15 @@ def tabs_set(data: pd.DataFrame, limit_data: pd.DataFrame) -> None:
             )
             feature_columns = st.multiselect(
                 "説明変数",
-                [col for col in numeric_columns if col != target_column],
-                default=[col for col in numeric_columns if col != target_column],
+                [col for col in candidate_feature_columns if col != target_column],
+                default=[col for col in candidate_feature_columns if col != target_column],
                 key="feature_columns",
             )
             objective = st.radio("目的", ["最大化", "最小化"], horizontal=True)
             acquisition = st.selectbox("獲得関数", ["EI", "PI", "MI"], index=0)
             n_suggestions = st.number_input("提案する実験点数", 1, 50, 10, 1)
             max_candidates = st.number_input("候補点の上限", 500, 100_000, 20_000, 500)
+            show_progress = st.checkbox("計算の進み具合を表示", value=True)
 
             cache_key = optimization_cache_key(
                 data,
@@ -154,25 +180,30 @@ def tabs_set(data: pd.DataFrame, limit_data: pd.DataFrame) -> None:
                 acquisition,
                 n_suggestions,
                 max_candidates,
+                show_progress,
             )
 
             if st.checkbox("実験点の提案"):
                 if ss.get("optimization_cache_key") != cache_key:
-                    with st.spinner("ガウス過程回帰モデルを構築し、次の実験点を探索しています..."):
-                        try:
-                            bundle, next_samples, candidates = run_optimization(
-                                data=data,
-                                limit_data=limit_data,
-                                target_column=target_column,
-                                feature_columns=feature_columns,
-                                objective=objective,
-                                acquisition=acquisition,
-                                n_suggestions=int(n_suggestions),
-                                max_candidates=int(max_candidates),
-                            )
-                        except Exception as exc:
-                            st.error(f"実験点の提案に失敗しました: {exc}")
-                            return
+                    progress = st.progress(0, text="入力データを確認しています...") if show_progress else None
+                    try:
+                        bundle, next_samples, candidates = run_optimization(
+                            data=data,
+                            limit_data=limit_data,
+                            target_column=target_column,
+                            feature_columns=feature_columns,
+                            objective=objective,
+                            acquisition=acquisition,
+                            n_suggestions=int(n_suggestions),
+                            max_candidates=int(max_candidates),
+                            progress=progress,
+                        )
+                    except Exception as exc:
+                        st.error(f"実験点の提案に失敗しました: {exc}")
+                        return
+                    finally:
+                        if progress is not None:
+                            progress.empty()
                     ss["optimization_cache_key"] = cache_key
                     ss["model_bundle"] = bundle
                     ss["next_samples"] = next_samples
@@ -183,14 +214,17 @@ def tabs_set(data: pd.DataFrame, limit_data: pd.DataFrame) -> None:
                 display_model_results(data, bundle)
                 st.subheader("提案された実験点")
                 st.dataframe(next_samples, use_container_width=True)
+                suggestion_plot_controls(data, next_samples, bundle)
                 download_dataframe(next_samples, "提案結果を保存", "suggested_experiments")
 
     with tabs[2]:
         if "model_bundle" not in ss:
             st.info("先に「実験点の提案」タブでモデルを構築してください。")
-        elif st.checkbox("SHAP解析", help="モデルを構築してから実行できます"):
+        shap_sample_count = st.slider("SHAPに使う最大行数", 10, 300, 100, 10)
+        shap_background_count = st.slider("SHAPの背景データ最大行数", 10, 100, 50, 10)
+        if "model_bundle" in ss and st.checkbox("SHAP解析", help="モデルを構築してから実行できます"):
             with st.spinner("SHAP値を計算しています..."):
-                plot_path = shap_explain(ss["model_bundle"], data)
+                plot_path = shap_explain(ss["model_bundle"], data, shap_sample_count, shap_background_count)
             if plot_path is None:
                 st.warning("SHAPが利用できません。`pip install shap` 後に再実行してください。")
             else:
@@ -244,9 +278,13 @@ def run_optimization(
     acquisition: str,
     n_suggestions: int,
     max_candidates: int,
+    progress=None,
 ) -> tuple[ModelBundle, pd.DataFrame, pd.DataFrame]:
     if not feature_columns:
         raise ValueError("説明変数を1つ以上選択してください。")
+
+    if progress is not None:
+        progress.progress(10, text="目的変数と説明変数を整理しています...")
 
     clean_data = data[feature_columns + [target_column]].copy()
     clean_data = clean_data.dropna(subset=[target_column])
@@ -257,8 +295,14 @@ def run_optimization(
     y = clean_data[target_column].to_numpy(dtype=float)
     direction = 1 if objective == "最大化" else -1
 
+    if progress is not None:
+        progress.progress(25, text="カーネル候補を比較しています...")
     base_bundle = build_best_model(x, y, feature_columns, target_column)
+    if progress is not None:
+        progress.progress(55, text="探索範囲から候補点を作っています...")
     candidates = sample_generation(limit_data, x, feature_columns, max_candidates)
+    if progress is not None:
+        progress.progress(70, text="獲得関数で次の実験点を選んでいます...")
     next_samples = suggest_samples(
         x=x,
         y=y,
@@ -269,7 +313,10 @@ def run_optimization(
         direction=direction,
         acquisition=acquisition,
         n_suggestions=n_suggestions,
+        progress=progress,
     )
+    if progress is not None:
+        progress.progress(100, text="完了しました。")
     return base_bundle, next_samples, candidates
 
 
@@ -279,7 +326,9 @@ def build_best_model(
     feature_columns: list[str],
     target_column: str,
 ) -> ModelBundle:
-    kernels = kernel_candidates(x.shape[1])
+    numeric_features = x.select_dtypes(include=np.number).columns.tolist()
+    categorical_features = [col for col in feature_columns if col not in numeric_features]
+    kernels = kernel_candidates()
     cv = cv_strategy(len(x))
     best_score = -np.inf
     best_model: Pipeline | None = None
@@ -287,7 +336,7 @@ def build_best_model(
     best_kernel_name = ""
 
     for kernel in kernels:
-        model = make_model(kernel)
+        model = make_model(kernel, numeric_features, categorical_features)
         try:
             if cv is None:
                 cv_pred = np.repeat(np.mean(y), len(y))
@@ -304,7 +353,7 @@ def build_best_model(
             continue
 
     if best_model is None or best_cv_pred is None:
-        fallback = make_model(ConstantKernel(1.0) * RBF(length_scale=np.ones(x.shape[1])) + WhiteKernel())
+        fallback = make_model(ConstantKernel(1.0) * RBF(length_scale=1.0) + WhiteKernel(), numeric_features, categorical_features)
         best_model = fallback.fit(x, y)
         best_cv_pred = np.repeat(np.mean(y), len(y))
         best_kernel_name = "fallback RBF"
@@ -314,6 +363,8 @@ def build_best_model(
         model=best_model,
         feature_columns=feature_columns,
         target_column=target_column,
+        numeric_features=numeric_features,
+        categorical_features=categorical_features,
         cv_prediction=best_cv_pred,
         train_prediction=train_prediction,
         selected_kernel=best_kernel_name,
@@ -322,7 +373,7 @@ def build_best_model(
     )
 
 
-def make_model(kernel) -> Pipeline:
+def make_model(kernel, numeric_features: list[str], categorical_features: list[str]) -> Pipeline:
     gpr = GaussianProcessRegressor(
         kernel=kernel,
         alpha=1e-8,
@@ -330,17 +381,44 @@ def make_model(kernel) -> Pipeline:
         n_restarts_optimizer=0,
         random_state=RANDOM_STATE,
     )
+    transformers = []
+    if numeric_features:
+        transformers.append(
+            (
+                "numeric",
+                Pipeline(
+                    [
+                        ("imputer", SimpleImputer(strategy="median")),
+                        ("scaler", StandardScaler()),
+                    ]
+                ),
+                numeric_features,
+            )
+        )
+    if categorical_features:
+        transformers.append(
+            (
+                "categorical",
+                Pipeline(
+                    [
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+                    ]
+                ),
+                categorical_features,
+            )
+        )
+
     return Pipeline(
         [
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
+            ("preprocessor", ColumnTransformer(transformers=transformers, remainder="drop")),
             ("gpr", gpr),
         ]
     )
 
 
-def kernel_candidates(n_features: int) -> list:
-    length_scale = np.ones(n_features)
+def kernel_candidates() -> list:
+    length_scale = 1.0
     base = ConstantKernel(1.0, (1e-3, 1e3))
     noise = WhiteKernel(noise_level=1e-5, noise_level_bounds=(1e-9, 1e1))
     return [
@@ -387,7 +465,6 @@ def sample_generation(
         arr = np.column_stack([m.ravel() for m in mesh])
     else:
         arr = np.column_stack([rng.choice(values, size=max_candidates, replace=True) for values in grids])
-        arr = np.unique(arr, axis=0)
 
     candidates = pd.DataFrame(arr, columns=feature_columns)
     candidates = candidates.drop_duplicates(ignore_index=True)
@@ -403,13 +480,26 @@ def normalize_limit_data(limit_data: pd.DataFrame) -> pd.DataFrame:
 
 def candidate_values_for_column(col: str, specs: pd.DataFrame, observed: pd.Series) -> np.ndarray:
     observed_numeric = pd.to_numeric(observed, errors="coerce").dropna()
+    is_numeric_feature = pd.api.types.is_numeric_dtype(observed) or len(observed_numeric) == observed.notna().sum()
     if col in specs.index:
         row = specs.loc[col]
+        if not is_numeric_feature:
+            values = read_categories(row)
+            if not values:
+                values = pd.Series(observed.dropna().unique()).astype(str).tolist()
+            if not values:
+                raise ValueError(f"{col} のカテゴリ候補を決められません。")
+            return np.asarray(values, dtype=object)
         min_value = read_number(row, ["min", "lower", "下限"], observed_numeric.min())
         max_value = read_number(row, ["max", "upper", "上限"], observed_numeric.max())
         step = read_number(row, ["step", "刻み"], np.nan)
         points = int(read_number(row, ["points", "num", "候補数"], 25))
     else:
+        if not is_numeric_feature:
+            values = pd.Series(observed.dropna().unique()).astype(str).tolist()
+            if not values:
+                raise ValueError(f"{col} のカテゴリ候補を決められません。")
+            return np.asarray(values, dtype=object)
         min_value = float(observed_numeric.min())
         max_value = float(observed_numeric.max())
         step = np.nan
@@ -431,6 +521,22 @@ def candidate_values_for_column(col: str, specs: pd.DataFrame, observed: pd.Seri
     return np.asarray(values, dtype=float)
 
 
+def read_categories(row: pd.Series) -> list[str]:
+    for name in ["values", "categories", "choices", "候補", "カテゴリ"]:
+        if name in row.index and pd.notna(row[name]):
+            raw_value = row[name]
+            if isinstance(raw_value, str):
+                separators = [",", "|", ";"]
+                values = [raw_value]
+                for separator in separators:
+                    if separator in raw_value:
+                        values = raw_value.split(separator)
+                        break
+                return [value.strip() for value in values if value.strip()]
+            return [str(raw_value)]
+    return []
+
+
 def read_number(row: pd.Series, names: list[str], default: float) -> float:
     for name in names:
         if name in row.index and pd.notna(row[name]):
@@ -448,6 +554,7 @@ def suggest_samples(
     direction: int,
     acquisition: str,
     n_suggestions: int,
+    progress=None,
 ) -> pd.DataFrame:
     suggested_rows: list[dict[str, float]] = []
     train_x = x.copy()
@@ -458,6 +565,11 @@ def suggest_samples(
         if remaining.empty:
             break
 
+        if progress is not None:
+            progress.progress(
+                min(70 + int(25 * rank / max(n_suggestions, 1)), 98),
+                text=f"{rank} 件目の提案点を選んでいます...",
+            )
         model = clone(template_model).fit(train_x, direction * train_y)
         mean, std = predict_mean_std(model, remaining)
         score = acquisition_values(mean, std, np.max(direction * train_y), acquisition)
@@ -488,11 +600,21 @@ def remove_existing_candidates(
     observed_x: pd.DataFrame,
     feature_columns: list[str],
 ) -> pd.DataFrame:
-    rounded_candidates = candidates[feature_columns].round(12)
-    rounded_observed = observed_x[feature_columns].round(12)
-    existing = set(map(tuple, rounded_observed.to_numpy()))
-    mask = [tuple(row) not in existing for row in rounded_candidates.to_numpy()]
+    existing = {candidate_key(row, feature_columns) for _, row in observed_x[feature_columns].iterrows()}
+    mask = [candidate_key(row, feature_columns) not in existing for _, row in candidates[feature_columns].iterrows()]
     return candidates.loc[mask].reset_index(drop=True)
+
+
+def candidate_key(row: pd.Series, feature_columns: list[str]) -> tuple[str, ...]:
+    values: list[str] = []
+    for col in feature_columns:
+        value = row[col]
+        numeric_value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+        if pd.notna(numeric_value):
+            values.append(f"{float(numeric_value):.12g}")
+        else:
+            values.append(str(value))
+    return tuple(values)
 
 
 def predict_mean_std(model: Pipeline, candidates: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
@@ -533,6 +655,8 @@ def metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
 def display_model_results(data: pd.DataFrame, bundle: ModelBundle) -> None:
     y = data.dropna(subset=[bundle.target_column])[bundle.target_column].to_numpy(dtype=float)
     st.caption(f"選択されたカーネル: `{bundle.selected_kernel}`")
+    if bundle.categorical_features:
+        st.caption(f"カテゴリ変数: {', '.join(bundle.categorical_features)}")
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("トレーニングデータの予測結果")
@@ -568,15 +692,57 @@ def write_metrics(metric_values: dict[str, float], label: str) -> None:
     st.write(f"MAE for {label}: {metric_values['mae']:.3f}")
 
 
-def shap_explain(bundle: ModelBundle, data: pd.DataFrame) -> str | None:
+def suggestion_plot_controls(data: pd.DataFrame, suggestions: pd.DataFrame, bundle: ModelBundle) -> None:
+    numeric_features = [col for col in bundle.feature_columns if pd.api.types.is_numeric_dtype(data[col])]
+    if len(numeric_features) < 2:
+        return
+
+    st.subheader("提案点の可視化")
+    cols = st.columns(3)
+    x_col = cols[0].selectbox("提案図 X軸", numeric_features, index=0, key="suggestion_plot_x")
+    y_col = cols[1].selectbox("提案図 Y軸", numeric_features, index=min(1, len(numeric_features) - 1), key="suggestion_plot_y")
+    color_col = cols[2].selectbox(
+        "提案図 色",
+        [bundle.target_column, f"predicted_{bundle.target_column}", "rank", "なし"],
+        key="suggestion_plot_color",
+    )
+
+    observed = data[[x_col, y_col, bundle.target_column]].copy()
+    observed["kind"] = "実験済み"
+    observed["rank"] = np.nan
+    observed[f"predicted_{bundle.target_column}"] = observed[bundle.target_column]
+
+    proposed = suggestions[[x_col, y_col, "rank", f"predicted_{bundle.target_column}"]].copy()
+    proposed["kind"] = "提案"
+    proposed[bundle.target_column] = proposed[f"predicted_{bundle.target_column}"]
+
+    plot_data = pd.concat([observed, proposed], ignore_index=True)
+    fig = px.scatter(
+        plot_data,
+        x=x_col,
+        y=y_col,
+        color=None if color_col == "なし" else color_col,
+        symbol="kind",
+        hover_data=plot_data.columns,
+    )
+    fig.update_traces(marker=dict(size=10), selector=dict(mode="markers"))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def shap_explain(
+    bundle: ModelBundle,
+    data: pd.DataFrame,
+    sample_count: int = 100,
+    background_count: int = 50,
+) -> str | None:
     try:
         import shap
     except ImportError:
         return None
 
     x = data[bundle.feature_columns].copy()
-    background = x.sample(min(len(x), 50), random_state=RANDOM_STATE)
-    explain_x = x.sample(min(len(x), 100), random_state=RANDOM_STATE)
+    background = x.sample(min(len(x), background_count), random_state=RANDOM_STATE)
+    explain_x = x.sample(min(len(x), sample_count), random_state=RANDOM_STATE)
 
     def predict_from_array(values: np.ndarray) -> np.ndarray:
         frame = pd.DataFrame(values, columns=bundle.feature_columns)
